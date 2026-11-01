@@ -62,7 +62,7 @@ Usage of ./crunchyroll-downloader:
   -url string
         URL of the episode/season to download
   -verify
-        Decode every video keyframe and the audio of each finished file with FFmpeg, and delete the file if any part fails to decode (e.g. a segment that came out of decryption as noise) so the next run downloads it again
+        Decode every video keyframe and the audio of each finished file with FFmpeg, and delete the file if any part fails to decode (e.g. a segment that came out of decryption as noise) so the next run downloads it again. Needs an FFmpeg build that can decode H.264 and AAC
   -video-quality string
         Video quality (default "1080p")
 ```

@@ -1,19 +1,28 @@
 package main
 
 import (
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func useFFmpeg(t *testing.T, path string) {
+	t.Helper()
+	old := ffmpegPath
+	ffmpegPath = path
+	t.Cleanup(func() { ffmpegPath = old })
+}
 
 func TestVerifyOutput(t *testing.T) {
 	path, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		t.Skip("ffmpeg is not installed")
 	}
-	old := ffmpegPath
-	ffmpegPath = path
-	t.Cleanup(func() { ffmpegPath = old })
+	useFFmpeg(t, path)
+	if missing, err := missingDecoders(verifyCodecs); err != nil || len(missing) > 0 {
+		t.Skipf("ffmpeg can't decode %v: %v", missing, err)
+	}
 
 	// encode writes a 4 second H.264/AAC clip with a keyframe every second,
 	// passing extra to the output.
@@ -41,7 +50,21 @@ func TestVerifyOutput(t *testing.T) {
 		"-encryption_scheme", "cenc-aes-ctr",
 		"-encryption_key", "00112233445566778899aabbccddeeff",
 		"-encryption_kid", "0123456789abcdef0123456789abcdef")
-	if err := verifyOutput(encrypted); err == nil {
-		t.Error("undecrypted file passed verification")
+	if err := verifyOutput(encrypted); err == nil || errors.Is(err, errCannotVerify) {
+		t.Errorf("undecrypted file: got %v, want decode errors", err)
+	}
+
+	// FFmpeg failing outright, as it does without a decoder for the file's
+	// codec, says nothing about the file.
+	if err := verifyOutput(filepath.Join(dir, "missing.mkv")); !errors.Is(err, errCannotVerify) {
+		t.Errorf("unreadable file: got %v, want %v", err, errCannotVerify)
+	}
+}
+
+func TestVerifyOutputWithoutFFmpeg(t *testing.T) {
+	useFFmpeg(t, filepath.Join(t.TempDir(), "ffmpeg"))
+
+	if err := verifyOutput("episode.mkv"); !errors.Is(err, errCannotVerify) {
+		t.Errorf("got %v, want %v", err, errCannotVerify)
 	}
 }

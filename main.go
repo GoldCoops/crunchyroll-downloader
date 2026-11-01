@@ -23,7 +23,7 @@ var (
 	output        = flag.String("output-dir", ".", "Target base path for downloading")
 	headless      = flag.Bool("headless", false, "Print a plain started/finished line per track instead of live progress bars, for piping output to a log file")
 	tempDir       = flag.String("temp-dir", "", "Directory for temporary download files (video/audio/subtitles before merging). Defaults to $TMPDIR or the OS default temp directory; set this if that default is too small or slow for multi-GB downloads")
-	verify        = flag.Bool("verify", false, "Decode every video keyframe and the audio of each finished file with FFmpeg, and delete the file if any part fails to decode (e.g. a segment that came out of decryption as noise) so the next run downloads it again")
+	verify        = flag.Bool("verify", false, "Decode every video keyframe and the audio of each finished file with FFmpeg, and delete the file if any part fails to decode (e.g. a segment that came out of decryption as noise) so the next run downloads it again. Needs an FFmpeg build that can decode H.264 and AAC")
 )
 
 // backoff spaces out consecutive episode downloads by *downloadDelay. It is
@@ -190,6 +190,20 @@ func main() {
 		os.Exit(1)
 	}
 	ffmpegPath = ffmpeg
+
+	// Also checked up front: without these decoders every verification would
+	// fail, after the download it was meant to check.
+	if *verify {
+		missing, err := missingDecoders(verifyCodecs)
+		if err != nil {
+			fmt.Printf("Couldn't check whether FFmpeg can run -verify: %s\n", err)
+			os.Exit(1)
+		}
+		if len(missing) > 0 {
+			fmt.Printf("-verify needs FFmpeg to decode %s, but %s can't. Some bundled builds, such as Synology DSM's, leave these out.\nDownloads work without -verify, since merging doesn't decode anything. To use it, put a full FFmpeg build first on your PATH.\n", strings.Join(missing, " and "), ffmpegPath)
+			os.Exit(1)
+		}
+	}
 
 	token, err = GetAccessToken(*etpRt)
 	if errors.Is(err, errAuthRejected) {

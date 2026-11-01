@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,35 @@ func TestFindFFmpegMissing(t *testing.T) {
 	_, err := findFFmpegFrom(filepath.Join(exeDir, "crunchyroll-downloader"))
 	if !errors.Is(err, errFFmpegNotFound) {
 		t.Errorf("got error %v, want %v", err, errFFmpegNotFound)
+	}
+}
+
+func TestDecoderCodecs(t *testing.T) {
+	// Trimmed `ffmpeg -decoders` output, with the CRLF line endings it has on
+	// Windows.
+	list := strings.Join([]string{
+		"Decoders:",
+		" V..... = Video",
+		" A..... = Audio",
+		" ------",
+		" VFS..D h264                 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+		" V....D libopenh264          OpenH264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)",
+		" V..... libdav1d             dav1d AV1 decoder by VideoLAN (codec av1)",
+		" A....D aac_fixed            AAC (Advanced Audio Coding) (codec aac)",
+		"",
+	}, "\r\n")
+
+	got := decoderCodecs(list)
+	for _, codec := range []string{"h264", "av1", "aac"} {
+		if !got[codec] {
+			t.Errorf("codec %s is missing from %v", codec, got)
+		}
+	}
+	// The legend above the table isn't a decoder.
+	if got["="] || got["Video"] {
+		t.Errorf("legend parsed as decoders: %v", got)
+	}
+	if got["hevc"] {
+		t.Error("hevc reported without a decoder")
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -116,7 +117,11 @@ func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outp
 
 	if *verify {
 		fmt.Println("Verifying...")
-		if err := verifyOutput(outputFile); err != nil {
+		if err := verifyOutput(outputFile); errors.Is(err, errCannotVerify) {
+			// The check itself failing says nothing about the file, so it's
+			// no reason to throw the download away.
+			fmt.Printf("! Kept %s without verifying it: %s\n", outputFile, err)
+		} else if err != nil {
 			_ = os.Remove(outputFile)
 			panic(fmt.Sprintf("verification failed, the file was deleted so the next run downloads it again: %s", err))
 		}
@@ -138,6 +143,15 @@ func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outp
 // reports. A segment of noise produces an error for nearly every macroblock.
 const maxVerifyErrorLines = 10
 
+// ffmpegDecodeErrorExit is FFmpeg's exit code when the share of frames that
+// failed to decode exceeds -max_error_rate (2/3 by default).
+const ffmpegDecodeErrorExit = 69
+
+// errCannotVerify marks a verification that couldn't run, e.g. because FFmpeg
+// has no decoder for one of the file's codecs, as opposed to one that found
+// decode errors.
+var errCannotVerify = errors.New("couldn't run the check")
+
 // verifyOutput decodes every video keyframe and all audio of file and fails on
 // any decode error. Each fragment of the source starts on a keyframe, so a
 // fragment that decryption turned into noise without failing is caught here.
@@ -154,11 +168,16 @@ func verifyOutput(file string) error {
 		lines = append(lines[:maxVerifyErrorLines], fmt.Sprintf("... and %d more lines", len(lines)-maxVerifyErrorLines))
 	}
 	details := strings.Join(lines, "\n")
-	if runErr != nil {
-		return fmt.Errorf("ffmpeg: %w\n%s", runErr, details)
-	}
-	if details != "" {
+
+	// Decode errors leave FFmpeg's exit code at 0 unless they are so frequent
+	// that it gives up. Any other failure means it couldn't check the file.
+	var exitErr *exec.ExitError
+	switch {
+	case runErr == nil && details == "":
+		return nil
+	case runErr == nil, errors.As(runErr, &exitErr) && exitErr.ExitCode() == ffmpegDecodeErrorExit:
 		return fmt.Errorf("decode errors:\n%s", details)
+	default:
+		return fmt.Errorf("%w: ffmpeg: %v\n%s", errCannotVerify, runErr, details)
 	}
-	return nil
 }
