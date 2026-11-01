@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // mediaTrack pairs a downloaded temporary file with the locale it represents.
@@ -113,6 +114,14 @@ func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outp
 		panic(fmt.Sprintf("ffmpeg failed: %s\n%s", err, stderr.String()))
 	}
 
+	if *verify {
+		fmt.Println("Verifying...")
+		if err := verifyOutput(outputFile); err != nil {
+			_ = os.Remove(outputFile)
+			panic(fmt.Sprintf("verification failed, the file was deleted so the next run downloads it again: %s", err))
+		}
+	}
+
 	// Remove temporary files
 	_ = os.Remove(videoFile)
 	for _, audio := range audioTracks {
@@ -123,4 +132,33 @@ func mergeEverything(videoFile string, audioTracks, subTracks []mediaTrack, outp
 	}
 
 	fmt.Printf("\nDownload finished! Output file: %s\n\n", outputFile)
+}
+
+// maxVerifyErrorLines caps how much of FFmpeg's output a failed verification
+// reports. A segment of noise produces an error for nearly every macroblock.
+const maxVerifyErrorLines = 10
+
+// verifyOutput decodes every video keyframe and all audio of file and fails on
+// any decode error. Each fragment of the source starts on a keyframe, so a
+// fragment that decryption turned into noise without failing is caught here.
+// Decoding only keyframes keeps this to a few seconds per episode.
+func verifyOutput(file string) error {
+	cmd := exec.Command(ffmpegPath, "-v", "error", "-skip_frame:v", "nokey", "-i", file,
+		"-map", "0:v:0", "-map", "0:a?", "-f", "null", "-")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) > maxVerifyErrorLines {
+		lines = append(lines[:maxVerifyErrorLines], fmt.Sprintf("... and %d more lines", len(lines)-maxVerifyErrorLines))
+	}
+	details := strings.Join(lines, "\n")
+	if runErr != nil {
+		return fmt.Errorf("ffmpeg: %w\n%s", runErr, details)
+	}
+	if details != "" {
+		return fmt.Errorf("decode errors:\n%s", details)
+	}
+	return nil
 }

@@ -23,6 +23,7 @@ var (
 	output        = flag.String("output-dir", ".", "Target base path for downloading")
 	headless      = flag.Bool("headless", false, "Print a plain started/finished line per track instead of live progress bars, for piping output to a log file")
 	tempDir       = flag.String("temp-dir", "", "Directory for temporary download files (video/audio/subtitles before merging). Defaults to $TMPDIR or the OS default temp directory; set this if that default is too small or slow for multi-GB downloads")
+	verify        = flag.Bool("verify", false, "Decode every video keyframe and the audio of each finished file with FFmpeg, and delete the file if any part fails to decode (e.g. a segment that came out of decryption as noise) so the next run downloads it again")
 )
 
 // backoff spaces out consecutive episode downloads by *downloadDelay. It is

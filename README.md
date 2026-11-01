@@ -61,6 +61,8 @@ Usage of ./crunchyroll-downloader:
         Subtitle language(s), comma-separated (e.g. "fr-FR,ALL"). Add ALL for every available subtitle; explicit languages lead, the first available track is default, and ALL alone prefers en-US (default "en-US")
   -url string
         URL of the episode/season to download
+  -verify
+        Decode every video keyframe and the audio of each finished file with FFmpeg, and delete the file if any part fails to decode (e.g. a segment that came out of decryption as noise) so the next run downloads it again
   -video-quality string
         Video quality (default "1080p")
 ```

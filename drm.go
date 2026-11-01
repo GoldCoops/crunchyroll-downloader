@@ -215,8 +215,27 @@ func getLicense(psshData, contentId, videoToken string) ([]*widevine.Key, error)
 // license carries a separate key per track.
 //
 // initData is the initialization segment on its own. The KID lives there, so
-// the key can be selected without reading the media.
-func decryptMP4(initData []byte, media io.Reader, licenseKeys []*widevine.Key, output io.Writer) error {
+// the key can be selected without reading the media. media must start with the
+// same init segment, followed by the media segments.
+//
+// The media is decrypted one fragment at a time, so memory use is bounded by
+// the largest fragment instead of the whole track. gowidevine's DecryptMP4
+// decodes the entire file into memory first, which held every track of an
+// episode in RAM at once and exhausted memory on small machines.
+//
+// Decrypting with the wrong key or IV doesn't fail, it just produces noise, so
+// anything mp4ff would get silently wrong is rejected with an error instead of
+// leaving a few seconds of garbage in the middle of an otherwise fine file.
+func decryptMP4(initData []byte, media io.Reader, licenseKeys []*widevine.Key, output io.Writer) (err error) {
+	// mp4ff panics on some malformed input. Decryption runs on a download
+	// worker goroutine, where a panic would crash the whole program instead
+	// of failing this episode.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("malformed MP4: %v", r)
+		}
+	}()
+
 	init, err := mp4.DecodeFile(bytes.NewReader(initData))
 	if err != nil {
 		return fmt.Errorf("decode MP4 init segment: %w", err)
@@ -229,7 +248,29 @@ func decryptMP4(initData []byte, media io.Reader, licenseKeys []*widevine.Key, o
 	if err != nil {
 		return fmt.Errorf("read MP4 encryption info: %w", err)
 	}
+	key, err := contentKeyFor(decryptInfo, licenseKeys)
+	if err != nil {
+		return err
+	}
+	for _, trak := range init.Init.Moov.Traks {
+		if _, tenc := encryptedTrack(decryptInfo, trak.Tkhd.TrackID); tenc != nil {
+			if err = checkSeig(trak.Mdia.Minf.Stbl.Children, tenc); err != nil {
+				return err
+			}
+		}
+	}
 
+	// DecryptInit has already stripped the encryption boxes from the init
+	// segment, so it can be written out as is.
+	if err = init.Init.Encode(output); err != nil {
+		return fmt.Errorf("write init segment: %w", err)
+	}
+	return decryptFragments(media, decryptInfo, key, output)
+}
+
+// contentKeyFor returns the license content key matching the KID of the first
+// encrypted track that has one.
+func contentKeyFor(decryptInfo mp4.DecryptInfo, licenseKeys []*widevine.Key) (*widevine.Key, error) {
 	var unmatched []string
 	for _, track := range decryptInfo.TrackInfos {
 		if track.Sinf == nil || track.Sinf.Schi == nil || track.Sinf.Schi.Tenc == nil {
@@ -239,15 +280,203 @@ func decryptMP4(initData []byte, media io.Reader, licenseKeys []*widevine.Key, o
 		// Match this track's KID with a content key returned by the license.
 		for _, key := range licenseKeys {
 			if key.Type == widevinepb.License_KeyContainer_CONTENT && bytes.Equal(key.ID, kid) {
-				return widevine.DecryptMP4(media, key.Key, output)
+				return key, nil
 			}
 		}
 		// Keep looking: a later track may still match a key in the license.
-		unmatched = append(unmatched, fmt.Sprintf("%x", kid))
+		// The conversion skips UUID's String method, which %x would hex-encode.
+		unmatched = append(unmatched, fmt.Sprintf("%x", []byte(kid)))
 	}
 
 	if len(unmatched) > 0 {
-		return fmt.Errorf("no license key found for MP4 KID(s) %s", strings.Join(unmatched, ", "))
+		return nil, fmt.Errorf("no license key found for MP4 KID(s) %s", strings.Join(unmatched, ", "))
 	}
-	return errors.New("MP4 has no encrypted tracks")
+	return nil, errors.New("MP4 has no encrypted tracks")
+}
+
+// decryptFragments reads media box by box and writes each fragment (optional
+// emsg boxes, a moof and its mdat) to output as soon as it is decrypted. The
+// ftyp and moov repeat the init segment decryptMP4 has already written. sidx
+// boxes are dropped because decryption shrinks the moofs they index, which is
+// also what gowidevine's DecryptMP4 did.
+func decryptFragments(media io.Reader, decryptInfo mp4.DecryptInfo, key *widevine.Key, output io.Writer) error {
+	var (
+		pos       uint64
+		frag      *mp4.Fragment
+		encrypted bool // whether any fragment so far was encrypted
+	)
+	for {
+		// Positions are tracked from the start of media, as mp4ff's own file
+		// decoder does, so absolute sample offsets in the moofs still resolve.
+		box, err := mp4.DecodeBox(pos, media)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("decode MP4 box at %d: %w", pos, err)
+		}
+		boxPos := pos
+		pos += box.Size()
+
+		switch b := box.(type) {
+		case *mp4.StypBox:
+			if err = b.Encode(output); err != nil {
+				return fmt.Errorf("write styp: %w", err)
+			}
+		case *mp4.EmsgBox, *mp4.MoofBox:
+			if frag == nil || frag.Moof != nil {
+				frag = mp4.NewFragment()
+			}
+			frag.AddChild(b)
+		case *mp4.MdatBox:
+			if frag == nil || frag.Moof == nil {
+				return fmt.Errorf("mdat at %d has no preceding moof", boxPos)
+			}
+			frag.AddChild(b)
+			var fragEncrypted bool
+			if fragEncrypted, err = decryptFragment(frag, decryptInfo, key); err != nil {
+				return fmt.Errorf("fragment at %d: %w", frag.Moof.StartPos, err)
+			}
+			// A clear lead only happens at the start of a stream. A fragment
+			// without sample encryption info after that is far more likely
+			// broken than in the clear, and passing it through would leave a
+			// few seconds of noise in the output.
+			if encrypted && !fragEncrypted {
+				return fmt.Errorf("fragment at %d has no sample encryption info, but earlier fragments were encrypted", frag.Moof.StartPos)
+			}
+			encrypted = encrypted || fragEncrypted
+			if err = frag.Encode(output); err != nil {
+				return fmt.Errorf("write fragment: %w", err)
+			}
+			frag = nil
+		}
+	}
+	if frag != nil && frag.Moof != nil {
+		return errors.New("MP4 ends with a moof that has no mdat")
+	}
+	return nil
+}
+
+// decryptFragment decrypts frag in place and reports whether it was encrypted.
+// A fragment with no sample encryption box is in the clear and left untouched:
+// a stream may start with unencrypted segments before switching to encrypted
+// ones. See https://github.com/iyear/gowidevine/pull/26#issuecomment-2385960551
+func decryptFragment(frag *mp4.Fragment, decryptInfo mp4.DecryptInfo, key *widevine.Key) (bool, error) {
+	encrypted := false
+	for _, traf := range frag.Moof.Trafs {
+		hasSenc, parsed := traf.ContainsSencBox()
+		if !hasSenc {
+			continue
+		}
+		info, tenc := encryptedTrack(decryptInfo, traf.Tfhd.TrackID)
+		if tenc == nil {
+			continue // mp4ff leaves tracks in the clear alone
+		}
+		encrypted = true
+
+		// Every encrypted track is decrypted with the one key that was
+		// selected, so one with another KID would come out as noise.
+		if !bytes.Equal(tenc.DefaultKID, key.ID) {
+			return false, fmt.Errorf("track %d is encrypted with KID %x, not the license key's %x", traf.Tfhd.TrackID, []byte(tenc.DefaultKID), key.ID)
+		}
+		if err := checkSeig(traf.Children, tenc); err != nil {
+			return false, err
+		}
+		if !parsed {
+			if err := traf.ParseReadSenc(tenc.DefaultPerSampleIVSize, frag.Moof.StartPos); err != nil {
+				return false, fmt.Errorf("read sample encryption info: %w", err)
+			}
+		}
+		samples, err := frag.GetFullSamples(info.Trex)
+		if err != nil {
+			return false, fmt.Errorf("read samples: %w", err)
+		}
+		senc := traf.Senc
+		if senc == nil {
+			senc = traf.UUIDSenc.Senc
+		}
+		if err = checkSampleEncryption(samples, senc, tenc); err != nil {
+			return false, err
+		}
+	}
+	if !encrypted {
+		return false, nil
+	}
+	if err := mp4.DecryptFragment(frag, decryptInfo, key.Key); err != nil {
+		return false, fmt.Errorf("decrypt: %w", err)
+	}
+	return true, nil
+}
+
+// encryptedTrack returns the decryption info of a track and its default
+// encryption parameters. tenc is nil for a track in the clear.
+func encryptedTrack(decryptInfo mp4.DecryptInfo, trackID uint32) (info mp4.DecryptTrackInfo, tenc *mp4.TencBox) {
+	for _, info = range decryptInfo.TrackInfos {
+		if info.TrackID == trackID {
+			if info.Sinf != nil && info.Sinf.Schi != nil {
+				tenc = info.Sinf.Schi.Tenc
+			}
+			return info, tenc
+		}
+	}
+	return mp4.DecryptTrackInfo{}, nil
+}
+
+// checkSeig rejects 'seig' sample group entries in boxes that differ from the
+// track's default encryption parameters. mp4ff only takes the IV size from
+// them, so a group that switches key (key rotation) or marks samples as clear
+// would be decrypted with the default key and come out as noise.
+func checkSeig(boxes []mp4.Box, tenc *mp4.TencBox) error {
+	for _, box := range boxes {
+		sgpd, ok := box.(*mp4.SgpdBox)
+		if !ok || sgpd.GroupingType != "seig" {
+			continue
+		}
+		for _, entry := range sgpd.SampleGroupEntries {
+			seig, ok := entry.(*mp4.SeigSampleGroupEntry)
+			if !ok || seig.IsProtected != tenc.DefaultIsProtected ||
+				!bytes.Equal(seig.KID, tenc.DefaultKID) ||
+				seig.PerSampleIVSize != tenc.DefaultPerSampleIVSize ||
+				!bytes.Equal(seig.ConstantIV, tenc.DefaultConstantIV) ||
+				seig.CryptByteBlock != tenc.DefaultCryptByteBlock ||
+				seig.SkipByteBlock != tenc.DefaultSkipByteBlock {
+				return errors.New("MP4 changes encryption parameters partway through (e.g. key rotation), which isn't supported")
+			}
+		}
+	}
+	return nil
+}
+
+// checkSampleEncryption verifies that senc fully describes every sample before
+// mp4ff decrypts them. On a mismatched IV count mp4ff quietly decrypts with a
+// zero IV, on subsample ranges shorter than a sample it leaves the rest of the
+// sample encrypted, and on longer ones it panics.
+func checkSampleEncryption(samples []mp4.FullSample, senc *mp4.SencBox, tenc *mp4.TencBox) error {
+	if tenc.DefaultPerSampleIVSize > 0 {
+		if len(senc.IVs) != len(samples) {
+			return fmt.Errorf("sample encryption info has %d IVs for %d samples", len(senc.IVs), len(samples))
+		}
+	} else if len(tenc.DefaultConstantIV) == 0 {
+		return errors.New("track has neither per-sample nor constant IVs")
+	}
+
+	if len(senc.SubSamples) == 0 {
+		return nil // every sample is encrypted in full
+	}
+	if len(senc.SubSamples) != len(samples) {
+		return fmt.Errorf("sample encryption info has subsample ranges for %d of %d samples", len(senc.SubSamples), len(samples))
+	}
+	for i, sample := range samples {
+		if len(senc.SubSamples[i]) == 0 {
+			continue // encrypted in full
+		}
+		var covered uint64
+		for _, ss := range senc.SubSamples[i] {
+			covered += uint64(ss.BytesOfClearData) + uint64(ss.BytesOfProtectedData)
+		}
+		if covered != uint64(len(sample.Data)) {
+			return fmt.Errorf("subsample ranges of sample %d cover %d of its %d bytes", i, covered, len(sample.Data))
+		}
+	}
+	return nil
 }
